@@ -1,0 +1,121 @@
+name: Azure専用線新規申請workflow
+
+# GitHub APIから実行する場合:
+# POST /repos/{owner}/{repo}/actions/workflows/developer-azureDedicatedLine-create-workflow.yml/dispatches
+# {
+#   "ref": "feature/githubActions",
+#   "inputs": {
+#     "env_path": "PID-ENV-001",
+#     "event_id": "github:completion:12345"
+#   }
+# }
+# 注意: このworkflowは開発環境専用です。
+# 完了通知先は開発環境のAxon Ivy APIに固定しています。
+# https://004.dev.axonivy.ricoh.com/digitalServiceRequest/api/github/workflowCompleted
+on:
+  workflow_dispatch:
+    inputs:
+      env_path:
+        description: "Azure環境パスとして使用するPID-ENV-XXX"
+        required: true
+        type: string
+      event_id:
+        description: "workflow実行とAxon Ivyの処理を紐付けるイベントID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test-api:
+    name: Azure専用線APIのテスト
+    runs-on: ubuntu-latest
+    steps:
+      - name: 入力値を検証して表示
+        env:
+          ENV_PATH: ${{ inputs.env_path }}
+          EVENT_ID: ${{ inputs.event_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ENV_PATH}" ]]; then
+            echo "::error::env_pathは必須です"
+            exit 1
+          fi
+
+          if [[ -z "${EVENT_ID}" ]]; then
+            echo "::error::event_idは必須です"
+            exit 1
+          fi
+
+          {
+            echo "### Azure専用線APIテスト"
+            echo
+            echo "| 入力項目 | 値 |"
+            echo "| --- | --- |"
+            echo "| env_path | ${ENV_PATH} |"
+            echo "| event_id | ${EVENT_ID} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "テストAPIがenv_path=${ENV_PATH}を受信しました"
+          echo "テストAPIがevent_id=${EVENT_ID}を受信しました"
+
+      - name: Axon Ivyへworkflow完了を通知
+        if: ${{ success() }}
+        env:
+          # 開発環境専用。ほかの環境へ展開する場合は必ず変更すること。
+          AXON_IVY_CALLBACK_URL: https://004.dev.axonivy.ricoh.com/digitalServiceRequest/api/github/workflowCompleted
+          EVENT_ID: ${{ inputs.event_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${AXON_IVY_CALLBACK_URL}" ]]; then
+            echo "::error::開発環境のAXON_IVY_CALLBACK_URLが設定されていません"
+            exit 1
+          fi
+
+          callback_response="$(mktemp)"
+          trap 'rm -f "${callback_response}"' EXIT
+
+          for attempt in {1..12}; do
+            if http_status="$(
+              curl \
+                --silent \
+                --show-error \
+                --output "${callback_response}" \
+                --write-out "%{http_code}" \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --request POST \
+                --get \
+                --header "Accept: application/json" \
+                --data-urlencode "eventId=${EVENT_ID}" \
+                "${AXON_IVY_CALLBACK_URL}"
+            )"; then
+              if [[ "${http_status}" =~ ^2 ]]; then
+                cat "${callback_response}"
+                exit 0
+              fi
+
+              if [[ "${http_status}" != "409" ]]; then
+                cat "${callback_response}" >&2
+                echo "::error::Axon Ivy callback APIへの通知に失敗しました。HTTPステータス: ${http_status}"
+                exit 1
+              fi
+            else
+              cat "${callback_response}" >&2
+              echo "::error::Axon Ivy callback APIへのリクエストに失敗しました"
+              exit 1
+            fi
+
+            if (( attempt < 12 )); then
+              sleep 5
+            fi
+          done
+
+          cat "${callback_response}" >&2
+          echo "::error::再試行回数の上限に達してもAxon Ivy callback APIがPENDINGのままです"
+          exit 1
