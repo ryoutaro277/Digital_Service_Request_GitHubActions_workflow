@@ -1,0 +1,2 @@
+# Digital_Service_Request_GitHubActions_workflow
+デジタルサービス利用申請用のGitHubActionsのworkflowを管理
